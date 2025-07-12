@@ -1,3 +1,4 @@
+const PORT = process.env.PORT || 3001;
 // Import necessary modules for Firebase Functions, Admin SDK, Express, CORS, and node-fetch
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
@@ -136,4 +137,6 @@ app.post('/grant-admin-role', async (req, res) => {
 });
 
 // Expose the Express app as a single Cloud Function named 'api'.
-exports.api = functions.https.onRequest(app);
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
