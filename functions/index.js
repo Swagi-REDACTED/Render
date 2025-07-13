@@ -100,7 +100,6 @@ const authenticate = async (req, res, next) => {
   const idToken = req.headers.authorization.split('Bearer ')[1];
   try {
     req.user = await admin.auth().verifyIdToken(idToken);
-    // Add a check to see if the user is the owner but hasn't claimed the role yet.
     if (req.user.email === process.env.OWNER_EMAIL && !req.user.owner) {
         req.user.is_owner_unclaimed = true;
     }
