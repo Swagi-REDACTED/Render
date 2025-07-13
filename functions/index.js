@@ -6,7 +6,6 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 // --- IMPORTANT: Initialize Firebase Admin SDK for a server environment ---
-// This requires a service account key provided as an environment variable.
 try {
   const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
   admin.initializeApp({
@@ -43,37 +42,8 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-
-// --- OWNER-ONLY FUNCTION TO CLAIM THE FIRST ADMIN ROLE ---
-app.post('/claim-admin-role', authenticate, async (req, res) => {
-    const ownerEmail = process.env.OWNER_EMAIL;
-
-    if (!ownerEmail) {
-        console.error('OWNER_EMAIL is not set in environment variables.');
-        return res.status(500).send({ error: 'Server configuration error: Owner email not set.' });
-    }
-
-    if (req.user.email !== ownerEmail) {
-        return res.status(403).send({ error: 'Forbidden: Only the designated owner can claim the admin role.' });
-    }
-    
-    try {
-        // UPDATED: Set both admin and owner claims for the owner.
-        await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
-        return res.status(200).send({ message: `Success! You (${req.user.email}) have been granted owner & admin privileges.` });
-    } catch (error) {
-        console.error('Error granting initial owner role:', error);
-        return res.status(500).send({ error: 'Failed to grant owner role.' });
-    }
-});
-
-
-// Apply the authentication middleware to all subsequent routes.
-app.use(authenticate);
-
-/**
- * Route to act as a secure proxy for the GitHub API.
- */
+// --- PUBLIC GITHUB PROXY ROUTE ---
+// This route does NOT use the authenticate middleware, so anyone can call it.
 app.post('/github-proxy', async (req, res) => {
   const { githubApiUrl, method = 'GET', body = null } = req.body;
 
@@ -81,6 +51,7 @@ app.post('/github-proxy', async (req, res) => {
     return res.status(400).send({ error: 'Missing githubApiUrl in request body.' });
   }
 
+  // The backend always uses the secure owner's token to talk to GitHub.
   const githubToken = process.env.GITHUB_TOKEN;
   if (!githubToken) {
     console.error('GITHUB_TOKEN is not set in environment variables.');
@@ -110,28 +81,43 @@ app.post('/github-proxy', async (req, res) => {
   }
 });
 
-/**
- * Administrative route to grant another user an 'admin' role.
- * Only the owner can perform this action.
- */
+
+// --- SECURE ADMIN & OWNER ROUTES ---
+// All routes defined below this line will use the 'authenticate' middleware.
+app.use(authenticate);
+
+// --- OWNER-ONLY FUNCTION TO CLAIM THE FIRST ADMIN ROLE ---
+app.post('/claim-admin-role', async (req, res) => {
+    const ownerEmail = process.env.OWNER_EMAIL;
+    if (!ownerEmail) {
+        return res.status(500).send({ error: 'Server configuration error: Owner email not set.' });
+    }
+    if (req.user.email !== ownerEmail) {
+        return res.status(403).send({ error: 'Forbidden: Only the designated owner can claim the admin role.' });
+    }
+    try {
+        await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
+        return res.status(200).send({ message: `Success! You (${req.user.email}) have been granted owner & admin privileges.` });
+    } catch (error) {
+        console.error('Error granting initial owner role:', error);
+        return res.status(500).send({ error: 'Failed to grant owner role.' });
+    }
+});
+
+// --- OWNER-ONLY ROUTE TO GRANT ADMIN ROLE ---
 app.post('/grant-admin-role', async (req, res) => {
-  // UPDATED: Check for owner claim, not just admin.
   if (req.user.owner !== true) {
     return res.status(403).send({ error: 'Forbidden: Only the owner can grant admin roles.' });
   }
-
   const { email } = req.body;
   if (!email) {
     return res.status(400).send({ error: 'Missing email in request body.' });
   }
-
   if (email === process.env.OWNER_EMAIL) {
       return res.status(400).send({ error: "Cannot change the owner's roles." });
   }
-
   try {
     const userToMakeAdmin = await admin.auth().getUserByEmail(email);
-    // Set only the admin claim for the new admin.
     await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, { admin: true });
     return res.status(200).send({ message: `Success! ${email} has been made an admin.` });
   } catch (error) {
@@ -140,29 +126,20 @@ app.post('/grant-admin-role', async (req, res) => {
   }
 });
 
-/**
- * NEW: Administrative route to REVOKE a user's 'admin' role.
- * Only the owner can perform this action.
- */
+// --- OWNER-ONLY ROUTE TO REVOKE ADMIN ROLE ---
 app.post('/revoke-admin-role', async (req, res) => {
-    // Check for owner claim.
     if (req.user.owner !== true) {
         return res.status(403).send({ error: 'Forbidden: Only the owner can revoke admin roles.' });
     }
-
     const { email } = req.body;
     if (!email) {
         return res.status(400).send({ error: 'Missing email in request body.' });
     }
-    
-    // The owner cannot revoke their own admin status.
     if (email === process.env.OWNER_EMAIL) {
         return res.status(400).send({ error: 'Owner cannot revoke their own admin role.' });
     }
-
     try {
         const userToRevoke = await admin.auth().getUserByEmail(email);
-        // Revoke claims by setting them to an empty object.
         await admin.auth().setCustomUserClaims(userToRevoke.uid, {});
         return res.status(200).send({ message: `Success! Admin role for ${email} has been revoked.` });
     } catch (error) {
