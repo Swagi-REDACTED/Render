@@ -5,154 +5,209 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 
-// --- IMPORTANT: Initialize Firebase Admin SDK for a server environment ---
+// --- Firebase Admin SDK Initialization ---
 try {
   const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
   console.log("Firebase Admin SDK initialized successfully.");
-} catch (error)
-{
-  console.error("Failed to initialize Firebase Admin SDK. Ensure GOOGLE_APPLICATION_CREDENTIALS_JSON is set correctly.", error);
+} catch (error) {
+  console.error("Failed to initialize Firebase Admin SDK.", error);
 }
 
-// Create an Express app to handle API requests
-const app = express();
+// --- Render API Helper Functions ---
+// IMPORTANT: For these functions to work, you MUST set the following
+// environment variables in your Render project settings:
+// 1. RENDER_API_KEY: Your personal Render API key.
+// 2. RENDER_SERVICE_ID: The ID of this service on Render.
+// 3. ADMIN_EMAILS: A comma-separated list of initial admin emails.
 
-// Enable Cross-Origin Resource Sharing (CORS)
-app.use(cors({ origin: true }));
-app.use(express.json()); // Middleware to parse JSON bodies
+const RENDER_API_KEY = process.env.RENDER_API_KEY;
+const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
+const RENDER_API_URL = `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars`;
 
 /**
- * Middleware to authenticate requests using Firebase ID tokens.
+ * Fetches all environment variables from the Render service.
+ * @returns {Promise<Array>} A promise that resolves to an array of environment variable objects.
  */
+async function getRenderEnvVars() {
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+        throw new Error('Render API key or Service ID is not configured on the server.');
+    }
+    const response = await fetch(RENDER_API_URL, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${RENDER_API_KEY}`,
+            'Accept': 'application/json',
+        },
+    });
+    if (!response.ok) {
+        const errorBody = await response.json();
+        console.error("Render API Error:", errorBody);
+        throw new Error('Failed to fetch environment variables from Render.');
+    }
+    return response.json();
+}
+
+/**
+ * Updates the environment variables on the Render service.
+ * This will trigger a new deployment on Render.
+ * @param {Array} envVars - The array of environment variable objects to set.
+ * @returns {Promise<Object>} A promise that resolves to the response from the Render API.
+ */
+async function updateRenderEnvVars(envVars) {
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+        throw new Error('Render API key or Service ID is not configured on the server.');
+    }
+    const response = await fetch(RENDER_API_URL, {
+        method: 'PUT',
+        headers: {
+            'Authorization': `Bearer ${RENDER_API_KEY}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(envVars),
+    });
+    if (!response.ok) {
+        const errorBody = await response.json();
+        console.error("Render API Error:", errorBody);
+        throw new Error('Failed to update environment variables on Render.');
+    }
+    return response.json();
+}
+
+
+// --- Express App Setup ---
+const app = express();
+app.use(cors({ origin: true }));
+app.use(express.json());
+
+// --- Authentication Middleware ---
 const authenticate = async (req, res, next) => {
   if (!req.headers.authorization || !req.headers.authorization.startsWith('Bearer ')) {
     return res.status(403).send({ error: 'Unauthorized: No token provided.' });
   }
   const idToken = req.headers.authorization.split('Bearer ')[1];
   try {
-    const decodedIdToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedIdToken;
+    req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (error) {
-    console.error('Error while verifying Firebase ID token:', error);
     res.status(403).send({ error: 'Unauthorized: Invalid token.' });
   }
 };
 
 // --- PUBLIC GITHUB PROXY ROUTE ---
-// This route does NOT use the authenticate middleware, so anyone can call it.
 app.post('/github-proxy', async (req, res) => {
   const { githubApiUrl, method = 'GET', body = null } = req.body;
-
-  if (!githubApiUrl) {
-    return res.status(400).send({ error: 'Missing githubApiUrl in request body.' });
-  }
-
-  // The backend always uses the secure owner's token to talk to GitHub.
+  if (!githubApiUrl) return res.status(400).send({ error: 'Missing githubApiUrl' });
   const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) {
-    console.error('GITHUB_TOKEN is not set in environment variables.');
-    return res.status(500).send({ error: 'Server configuration error: GitHub token not set.' });
-  }
-
+  if (!githubToken) return res.status(500).send({ error: 'Server configuration error' });
   try {
     const fetchOptions = {
       method: method,
-      headers: {
-        'Authorization': `Bearer ${githubToken}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${githubToken}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
     };
-
-    if (body && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
-      fetchOptions.body = JSON.stringify(body);
-    }
-
+    if (body) fetchOptions.body = JSON.stringify(body);
     const githubResponse = await fetch(githubApiUrl, fetchOptions);
     const data = await githubResponse.json();
     res.status(githubResponse.status).json(data);
   } catch (error) {
-    console.error('Error proxying request to GitHub:', error);
     res.status(500).send({ error: 'Internal Server Error' });
   }
 });
 
-
-// --- SECURE ADMIN & OWNER ROUTES ---
-// All routes defined below this line will use the 'authenticate' middleware.
+// Secure all following routes
 app.use(authenticate);
 
-// --- OWNER-ONLY FUNCTION TO CLAIM THE FIRST ADMIN ROLE ---
+// --- OWNER-ONLY ROUTES ---
 app.post('/claim-admin-role', async (req, res) => {
-    const ownerEmail = process.env.OWNER_EMAIL;
-    if (!ownerEmail) {
-        return res.status(500).send({ error: 'Server configuration error: Owner email not set.' });
-    }
-    if (req.user.email !== ownerEmail) {
-        return res.status(403).send({ error: 'Forbidden: Only the designated owner can claim the admin role.' });
+    if (req.user.email !== process.env.OWNER_EMAIL) {
+        return res.status(403).send({ error: 'Forbidden: Only the owner can perform this action.' });
     }
     try {
         await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
-        return res.status(200).send({ message: `Success! You (${req.user.email}) have been granted owner & admin privileges.` });
+        res.status(200).send({ message: 'Success! You have been granted owner & admin privileges.' });
     } catch (error) {
         console.error('Error granting initial owner role:', error);
-        return res.status(500).send({ error: 'Failed to grant owner role.' });
+        res.status(500).send({ error: 'Failed to grant owner role.' });
     }
 });
 
-// --- OWNER-ONLY ROUTE TO GRANT ADMIN ROLE ---
 app.post('/grant-admin-role', async (req, res) => {
-  if (req.user.owner !== true) {
-    return res.status(403).send({ error: 'Forbidden: Only the owner can grant admin roles.' });
-  }
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).send({ error: 'Missing email in request body.' });
-  }
-  if (email === process.env.OWNER_EMAIL) {
-      return res.status(400).send({ error: "Cannot change the owner's roles." });
-  }
-  try {
-    const userToMakeAdmin = await admin.auth().getUserByEmail(email);
-    // ✅ FIXED: Preserve existing claims instead of overwriting them.
-    const existingClaims = (await admin.auth().getUser(userToMakeAdmin.uid)).customClaims || {};
-    await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, {
-        ...existingClaims,
-        admin: true
-    });
-    return res.status(200).send({ message: `Success! ${email} has been made an admin.` });
-  } catch (error) {
-    console.error('Error granting admin role:', error);
-    return res.status(500).send({ error: 'Failed to grant admin role.' });
-  }
+    if (req.user.owner !== true) {
+        return res.status(403).send({ error: 'Forbidden: Only the owner can grant admin roles.' });
+    }
+    const { email } = req.body;
+    if (!email) return res.status(400).send({ error: 'Missing email.' });
+    if (email === process.env.OWNER_EMAIL) return res.status(400).send({ error: "Cannot change the owner's roles." });
+
+    try {
+        // Step 1: Set the custom claim in Firebase
+        const userToMakeAdmin = await admin.auth().getUserByEmail(email);
+        const existingClaims = (await admin.auth().getUser(userToMakeAdmin.uid)).customClaims || {};
+        await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, { ...existingClaims, admin: true });
+
+        // Step 2: Update the ADMIN_EMAILS environment variable on Render
+        const envVars = await getRenderEnvVars();
+        const adminEmailsVar = envVars.find(v => v.key === 'ADMIN_EMAILS');
+        
+        if (adminEmailsVar) {
+            let emails = adminEmailsVar.value ? adminEmailsVar.value.split(',').map(e => e.trim()) : [];
+            if (!emails.includes(email)) {
+                emails.push(email);
+                adminEmailsVar.value = emails.join(',');
+            }
+        } else {
+            // If ADMIN_EMAILS doesn't exist, create it.
+            envVars.push({ key: 'ADMIN_EMAILS', value: email });
+        }
+        
+        await updateRenderEnvVars(envVars);
+
+        res.status(200).send({ message: `Success! ${email} is now an admin. The server is restarting with new permissions.` });
+
+    } catch (error) {
+        console.error('Error in grant-admin-role:', error);
+        res.status(500).send({ error: error.message || 'Failed to grant admin role.' });
+    }
 });
 
-// --- OWNER-ONLY ROUTE TO REVOKE ADMIN ROLE ---
 app.post('/revoke-admin-role', async (req, res) => {
     if (req.user.owner !== true) {
         return res.status(403).send({ error: 'Forbidden: Only the owner can revoke admin roles.' });
     }
     const { email } = req.body;
-    if (!email) {
-        return res.status(400).send({ error: 'Missing email in request body.' });
-    }
-    if (email === process.env.OWNER_EMAIL) {
-        return res.status(400).send({ error: 'Owner cannot revoke their own admin role.' });
-    }
+    if (!email) return res.status(400).send({ error: 'Missing email.' });
+    if (email === process.env.OWNER_EMAIL) return res.status(400).send({ error: 'Cannot revoke the owner\'s admin role.' });
+
     try {
+        // Step 1: Revoke custom claim in Firebase
         const userToRevoke = await admin.auth().getUserByEmail(email);
-        // ✅ FIXED: Preserve other claims by just removing the admin one.
         const existingClaims = (await admin.auth().getUser(userToRevoke.uid)).customClaims || {};
-        delete existingClaims.admin;
+        delete existingClaims.admin; // Remove only the admin claim
         await admin.auth().setCustomUserClaims(userToRevoke.uid, existingClaims);
-        return res.status(200).send({ message: `Success! Admin role for ${email} has been revoked.` });
+
+        // Step 2: Update the ADMIN_EMAILS environment variable on Render
+        const envVars = await getRenderEnvVars();
+        const adminEmailsVar = envVars.find(v => v.key === 'ADMIN_EMAILS');
+        
+        if (adminEmailsVar && adminEmailsVar.value) {
+            let emails = adminEmailsVar.value.split(',').map(e => e.trim());
+            const initialLength = emails.length;
+            emails = emails.filter(e => e !== email);
+
+            if (emails.length < initialLength) {
+                adminEmailsVar.value = emails.join(',');
+                await updateRenderEnvVars(envVars);
+            }
+        }
+
+        res.status(200).send({ message: `Success! Admin role for ${email} has been revoked. The server is restarting.` });
+
     } catch (error) {
-        console.error('Error revoking admin role:', error);
-        return res.status(500).send({ error: 'Failed to remove admin role.' });
+        console.error('Error in revoke-admin-role:', error);
+        res.status(500).send({ error: error.message || 'Failed to revoke admin role.' });
     }
 });
 
