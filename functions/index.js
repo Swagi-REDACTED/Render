@@ -16,54 +16,86 @@ try {
   console.error("Failed to initialize Firebase Admin SDK.", error);
 }
 
-// --- Render API Helper Functions (No changes here) ---
-const RENDER_API_KEY = process.env.RENDER_API_KEY;
-const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
-const RENDER_API_URL = `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars`;
+const db = admin.firestore();
+const configDocRef = db.collection('appConfig').doc('main');
 
-async function getRenderEnvVars() {
-    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
-        throw new Error('Render API key or Service ID is not configured on the server.');
+// --- GitHub Caching Service ---
+
+/**
+ * Fetches the entire file tree for a single repository recursively.
+ * @param {string} user - The GitHub username.
+ * @param {string} repoName - The repository name.
+ * @param {string} branch - The branch to fetch.
+ * @param {string} token - The GitHub API token.
+ * @returns {Promise<Array|null>} A promise that resolves to the repository's file tree or null.
+ */
+async function fetchRepoTreeRecursive(user, repoName, branch, token) {
+    const url = `https://api.github.com/repos/${user}/${repoName}/git/trees/${branch}?recursive=1`;
+    try {
+        const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+        if (!response.ok) {
+            console.error(`Failed to fetch tree for ${repoName}: ${response.statusText}`);
+            return null;
+        }
+        const data = await response.json();
+        // Add a direct download_url to each file for easy access on the frontend
+        return data.tree.map(item => ({
+            ...item,
+            download_url: item.type === 'blob' ? `https://raw.githubusercontent.com/${user}/${repoName}/${branch}/${item.path}` : null
+        }));
+    } catch (error) {
+        console.error(`Error in fetchRepoTreeRecursive for ${repoName}:`, error);
+        return null;
     }
-    const response = await fetch(RENDER_API_URL, {
-        method: 'GET',
-        headers: {
-            'Authorization': `Bearer ${RENDER_API_KEY}`,
-            'Accept': 'application/json',
-        },
-    });
-    if (!response.ok) {
-        const errorBody = await response.json();
-        console.error("Render API Error (getRenderEnvVars):", errorBody);
-        throw new Error('Failed to fetch environment variables from Render.');
-    }
-    const rawVars = await response.json();
-    return rawVars.map(item => ({
-        key: item.envVar.key,
-        value: item.envVar.value,
-    })).filter(v => v.key);
 }
 
-async function updateRenderEnvVars(envVars) {
-    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
-        throw new Error('Render API key or Service ID is not configured on the server.');
+/**
+ * Iterates through all tracked repositories and updates their cached file trees in Firestore.
+ */
+async function syncAllTrackedRepos() {
+    console.log('Starting GitHub repository sync...');
+    const token = process.env.GITHUB_TOKEN;
+    if (!token) {
+        console.error('GITHUB_TOKEN is not set. Cannot sync repositories.');
+        return;
     }
-    const response = await fetch(RENDER_API_URL, {
-        method: 'PUT',
-        headers: {
-            'Authorization': `Bearer ${RENDER_API_KEY}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(envVars),
-    });
-    if (!response.ok) {
-        const errorBody = await response.json();
-        console.error("Render API Error (updateRenderEnvVars):", errorBody);
-        throw new Error('Failed to update environment variables on Render.');
+
+    try {
+        const docSnap = await configDocRef.get();
+        if (!docSnap.exists) {
+            console.log('Config document does not exist. Skipping sync.');
+            return;
+        }
+
+        const config = docSnap.data();
+        const user = config.githubUser;
+        const trackedRepos = config.trackedRepos || [];
+
+        if (!user || trackedRepos.length === 0) {
+            console.log('No GitHub user or tracked repos configured. Skipping sync.');
+            return;
+        }
+
+        for (const repo of trackedRepos) {
+            console.log(`- Syncing ${repo.name}...`);
+            const tree = await fetchRepoTreeRecursive(user, repo.name, repo.branch, token);
+            if (tree) {
+                repo.tree = tree; // Store the cached tree on the repo object
+                console.log(`- Successfully synced ${repo.name} with ${tree.length} items.`);
+            }
+        }
+
+        await configDocRef.update({ trackedRepos });
+        console.log('GitHub repository sync completed successfully.');
+    } catch (error) {
+        console.error('An error occurred during syncAllTrackedRepos:', error);
     }
-    return response.json();
 }
+
+// Schedule the sync to run every 24 hours and also run it once on startup.
+setInterval(syncAllTrackedRepos, 24 * 60 * 60 * 1000);
+setTimeout(syncAllTrackedRepos, 5000); // Run 5s after server start
+
 
 // --- Express App Setup ---
 const app = express();
@@ -84,118 +116,67 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-// All routes after this line are protected by authentication
+// All routes after this line are protected
 app.use(authenticate);
 
-// --- 🔒 SECURED GITHUB PROXY ROUTE ---
-// Changed from app.post to app.get and now reads from req.query
-app.get('/github-proxy', async (req, res) => {
-  const { url } = req.query; // ✅ FIXED: Read from query parameter
-  if (!url) {
-    return res.status(400).send({ error: 'Missing GitHub API URL in query parameter.' });
-  }
+// --- Admin-Only Routes ---
 
-  const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) {
-    return res.status(500).send({ error: 'Server configuration error: GITHUB_TOKEN not set.' });
-  }
+// Proxy for admins to fetch their full list of repos for management
+app.get('/admin/github-proxy', async (req, res) => {
+    const { url } = req.query;
+    const token = req.headers['x-github-token'];
+    if (!url || !token) return res.status(400).send({ error: 'Missing URL or GitHub Token' });
 
-  try {
-    const fetchOptions = {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${githubToken}`,
-        'Accept': 'application/vnd.github.v3+json',
-      },
-    };
-
-    const githubResponse = await fetch(url, fetchOptions);
-    const data = await githubResponse.json();
-
-    // Forward GitHub's status and response directly to the client
-    res.status(githubResponse.status).json(data);
-  } catch (error) {
-    console.error('Error in GitHub proxy:', error);
-    res.status(500).send({ error: 'Internal Server Error while contacting GitHub.' });
-  }
-});
-
-
-// --- OWNER-ONLY ROUTES (No changes needed below this line) ---
-app.post('/claim-admin-role', async (req, res) => {
-    if (req.user.email !== process.env.OWNER_EMAIL) {
-        return res.status(403).send({ error: 'Forbidden: Only the owner can perform this action.' });
-    }
     try {
-        await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
-        res.status(200).send({ message: 'Success! You have been granted owner & admin privileges.' });
+        const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+        const data = await response.json();
+        res.status(response.status).json(data);
     } catch (error) {
-        console.error('Error granting initial owner role:', error);
-        res.status(500).send({ error: 'Failed to grant owner role.' });
+        res.status(500).send({ error: 'Internal Server Error' });
     }
 });
 
-app.post('/grant-admin-role', async (req, res) => {
-    if (req.user.owner !== true) {
-        return res.status(403).send({ error: 'Forbidden: Only the owner can grant admin roles.' });
-    }
-    const { email } = req.body;
-    if (!email) return res.status(400).send({ error: 'Missing email.' });
-    if (email === process.env.OWNER_EMAIL) return res.status(400).send({ error: "Cannot change the owner's roles." });
+// Endpoint to manually trigger the repository sync
+app.post('/admin/sync-github', async (req, res) => {
+    if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
+    
+    syncAllTrackedRepos()
+        .then(() => res.status(200).send({ message: 'GitHub sync started successfully.' }))
+        .catch(err => res.status(500).send({ error: 'Failed to start sync.' }));
+});
 
+// --- Owner-Only User Management ---
+app.get('/admin/users', async (req, res) => {
+    if (!req.user.owner) return res.status(403).send({ error: 'Forbidden' });
     try {
-        const userToMakeAdmin = await admin.auth().getUserByEmail(email);
-        const existingClaims = (await admin.auth().getUser(userToMakeAdmin.uid)).customClaims || {};
-        await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, { ...existingClaims, admin: true });
-        const envVars = await getRenderEnvVars();
-        const adminEmailsVar = envVars.find(v => v.key === 'ADMIN_EMAILS');
-        if (adminEmailsVar) {
-            let emails = adminEmailsVar.value ? adminEmailsVar.value.split(',').map(e => e.trim()).filter(e => e) : [];
-            if (!emails.includes(email)) {
-                emails.push(email);
-                adminEmailsVar.value = emails.join(',');
-            }
-        } else {
-            envVars.push({ key: 'ADMIN_EMAILS', value: email });
+        const listUsersResult = await admin.auth().listUsers(1000);
+        const users = listUsersResult.users.map(user => ({
+            uid: user.uid,
+            email: user.email,
+            isAdmin: !!user.customClaims?.admin,
+            isOwner: !!user.customClaims?.owner,
+        }));
+        res.status(200).json(users);
+    } catch (error) {
+        res.status(500).send({ error: 'Failed to list users.' });
+    }
+});
+
+app.post('/admin/set-role', async (req, res) => {
+    if (!req.user.owner) return res.status(403).send({ error: 'Forbidden' });
+    const { uid, isAdmin } = req.body;
+    try {
+        const user = await admin.auth().getUser(uid);
+        if (user.customClaims?.owner) {
+            return res.status(400).send({ error: "Cannot change the owner's roles." });
         }
-        await updateRenderEnvVars(envVars);
-        res.status(200).send({ message: `Success! ${email} is now an admin. The server is restarting with new permissions.` });
+        await admin.auth().setCustomUserClaims(uid, { ...user.customClaims, admin: isAdmin });
+        res.status(200).send({ message: 'User role updated successfully.' });
     } catch (error) {
-        console.error('Error in grant-admin-role:', error);
-        res.status(500).send({ error: error.message || 'Failed to grant admin role.' });
+        res.status(500).send({ error: 'Failed to set user role.' });
     }
 });
 
-app.post('/revoke-admin-role', async (req, res) => {
-    if (req.user.owner !== true) {
-        return res.status(403).send({ error: 'Forbidden: Only the owner can revoke admin roles.' });
-    }
-    const { email } = req.body;
-    if (!email) return res.status(400).send({ error: 'Missing email.' });
-    if (email === process.env.OWNER_EMAIL) return res.status(400).send({ error: 'Cannot revoke the owner\'s admin role.' });
-
-    try {
-        const userToRevoke = await admin.auth().getUserByEmail(email);
-        const existingClaims = (await admin.auth().getUser(userToRevoke.uid)).customClaims || {};
-        delete existingClaims.admin;
-        await admin.auth().setCustomUserClaims(userToRevoke.uid, existingClaims);
-        const envVars = await getRenderEnvVars();
-        const adminEmailsVar = envVars.find(v => v.key === 'ADMIN_EMAILS');
-        if (adminEmailsVar && adminEmailsVar.value) {
-            let emails = adminEmailsVar.value.split(',').map(e => e.trim());
-            const initialLength = emails.length;
-            emails = emails.filter(e => e !== email);
-            if (emails.length < initialLength) {
-                adminEmailsVar.value = emails.join(',');
-                await updateRenderEnvVars(envVars);
-            }
-        }
-        res.status(200).send({ message: `Success! Admin role for ${email} has been revoked. The server is restarting.` });
-    } catch (error) {
-        console.error('Error in revoke-admin-role:', error);
-        res.status(500).send({ error: error.message || 'Failed to revoke admin role.' });
-    }
-});
 
 // Start the Express server
 app.listen(PORT, () => {
