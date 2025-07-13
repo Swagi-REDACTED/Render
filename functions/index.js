@@ -4,6 +4,7 @@ const admin = require('firebase-admin');
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const rateLimit = require('express-rate-limit'); // ✅ ADDED: For rate limiting
 
 // --- Firebase Admin SDK Initialization ---
 try {
@@ -91,6 +92,16 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
 
+// ✅ ADDED: Apply rate limiting to all requests to prevent abuse
+const limiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 100, // Limit each IP to 100 requests per window
+	standardHeaders: true,
+	legacyHeaders: false,
+    message: { error: 'Too many requests, please try again after 15 minutes.' }
+});
+app.use(limiter);
+
 // --- Authentication Middleware ---
 const authenticate = async (req, res, next) => {
   if (!req.headers.authorization || !req.headers.authorization.startsWith('Bearer ')) {
@@ -121,7 +132,8 @@ app.post('/github-proxy', async (req, res) => {
     const data = await githubResponse.json();
     res.status(githubResponse.status).json(data);
   } catch (error) {
-    res.status(500).send({ error: 'Internal Server Error' });
+    console.error('GitHub Proxy Error:', error); // ✅ CHANGED: Log the actual error
+    res.status(500).send({ error: 'Internal Server Error' }); // ✅ CHANGED: Send generic message
   }
 });
 
@@ -137,8 +149,8 @@ app.post('/claim-admin-role', async (req, res) => {
         await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
         res.status(200).send({ message: 'Success! You have been granted owner & admin privileges.' });
     } catch (error) {
-        console.error('Error granting initial owner role:', error);
-        res.status(500).send({ error: 'Failed to grant owner role.' });
+        console.error('Error granting initial owner role:', error); // ✅ CHANGED: Log the actual error
+        res.status(500).send({ error: 'Internal Server Error' }); // ✅ CHANGED: Send generic message
     }
 });
 
@@ -176,8 +188,8 @@ app.post('/grant-admin-role', async (req, res) => {
         res.status(200).send({ message: `Success! ${email} is now an admin. The server is restarting with new permissions.` });
 
     } catch (error) {
-        console.error('Error in grant-admin-role:', error);
-        res.status(500).send({ error: error.message || 'Failed to grant admin role.' });
+        console.error('Error in grant-admin-role:', error); // ✅ CHANGED: Log the actual error
+        res.status(500).send({ error: 'Internal Server Error' }); // ✅ CHANGED: Send generic message
     }
 });
 
@@ -214,8 +226,8 @@ app.post('/revoke-admin-role', async (req, res) => {
         res.status(200).send({ message: `Success! Admin role for ${email} has been revoked. The server is restarting.` });
 
     } catch (error) {
-        console.error('Error in revoke-admin-role:', error);
-        res.status(500).send({ error: error.message || 'Failed to revoke admin role.' });
+        console.error('Error in revoke-admin-role:', error); // ✅ CHANGED: Log the actual error
+        res.status(500).send({ error: 'Internal Server Error' }); // ✅ CHANGED: Send generic message
     }
 });
 
