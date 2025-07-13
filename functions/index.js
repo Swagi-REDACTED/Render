@@ -28,8 +28,8 @@ const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
 const RENDER_API_URL = `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars`;
 
 /**
- * Fetches all environment variables from the Render service.
- * @returns {Promise<Array>} A promise that resolves to an array of environment variable objects.
+ * Fetches all environment variables from the Render service and formats them correctly.
+ * @returns {Promise<Array>} A promise that resolves to an array of {key, value} objects.
  */
 async function getRenderEnvVars() {
     if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
@@ -44,16 +44,24 @@ async function getRenderEnvVars() {
     });
     if (!response.ok) {
         const errorBody = await response.json();
-        console.error("Render API Error:", errorBody);
+        console.error("Render API Error (getRenderEnvVars):", errorBody);
         throw new Error('Failed to fetch environment variables from Render.');
     }
-    return response.json();
+    const rawVars = await response.json();
+    // ✅ FIXED: Map the complex response from Render's GET endpoint to the simple
+    // {key, value} format required by the PUT endpoint. Also, filter out any
+    // potential variables that might not have a key to prevent errors.
+    return rawVars.map(item => ({
+        key: item.envVar.key,
+        value: item.envVar.value,
+    })).filter(v => v.key);
 }
+
 
 /**
  * Updates the environment variables on the Render service.
  * This will trigger a new deployment on Render.
- * @param {Array} envVars - The array of environment variable objects to set.
+ * @param {Array} envVars - The array of {key, value} objects to set.
  * @returns {Promise<Object>} A promise that resolves to the response from the Render API.
  */
 async function updateRenderEnvVars(envVars) {
@@ -71,7 +79,7 @@ async function updateRenderEnvVars(envVars) {
     });
     if (!response.ok) {
         const errorBody = await response.json();
-        console.error("Render API Error:", errorBody);
+        console.error("Render API Error (updateRenderEnvVars):", errorBody);
         throw new Error('Failed to update environment variables on Render.');
     }
     return response.json();
@@ -153,13 +161,13 @@ app.post('/grant-admin-role', async (req, res) => {
         const adminEmailsVar = envVars.find(v => v.key === 'ADMIN_EMAILS');
         
         if (adminEmailsVar) {
-            let emails = adminEmailsVar.value ? adminEmailsVar.value.split(',').map(e => e.trim()) : [];
+            let emails = adminEmailsVar.value ? adminEmailsVar.value.split(',').map(e => e.trim()).filter(e => e) : [];
             if (!emails.includes(email)) {
                 emails.push(email);
                 adminEmailsVar.value = emails.join(',');
             }
         } else {
-            // If ADMIN_EMAILS doesn't exist, create it.
+            // This case should not be hit if the user sets the ADMIN_EMAILS var, but is a fallback.
             envVars.push({ key: 'ADMIN_EMAILS', value: email });
         }
         
