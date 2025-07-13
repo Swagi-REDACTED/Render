@@ -21,39 +21,17 @@ const configDocRef = db.collection('appConfig').doc('main');
 
 // --- GitHub Caching Service ---
 
-/**
- * Fetches the entire file tree for a single repository recursively.
- * @param {string} user - The GitHub username.
- * @param {string} repoName - The repository name.
- * @param {string} branch - The branch to fetch.
- * @param {string} token - The GitHub API token.
- * @returns {Promise<Array|null>} A promise that resolves to the repository's file tree or null.
- */
-async function fetchRepoTreeRecursive(user, repoName, branch, token) {
-    const url = `https://api.github.com/repos/${user}/${repoName}/git/trees/${branch}?recursive=1`;
-    try {
-        const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
-        if (!response.ok) {
-            console.error(`Failed to fetch tree for ${repoName}: ${response.statusText}`);
-            return null;
-        }
-        const data = await response.json();
-        if (data.truncated) {
-            console.warn(`Warning: File tree for ${repoName} was truncated. Some files may be missing.`);
-        }
-        // Add a direct download_url to each file for easy access on the frontend
-        return data.tree.map(item => ({
-            ...item,
-            download_url: item.type === 'blob' ? `https://raw.githubusercontent.com/${user}/${repoName}/${branch}/${item.path}` : null
-        }));
-    } catch (error) {
-        console.error(`Error in fetchRepoTreeRecursive for ${repoName}:`, error);
-        return null;
+async function fetchFromGitHub(apiUrl, token) {
+    const response = await fetch(apiUrl, { headers: { 'Authorization': `Bearer ${token}` } });
+    if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({ message: response.statusText }));
+        throw new Error(`GitHub API Error: ${response.status} - ${errorBody.message}`);
     }
+    return response.json();
 }
 
 /**
- * Iterates through all tracked repositories and updates their cached file trees in Firestore.
+ * Fetches all necessary data for a repository (tree and branches) and caches it.
  */
 async function syncAllTrackedRepos() {
     console.log('Starting GitHub repository sync...');
@@ -65,27 +43,39 @@ async function syncAllTrackedRepos() {
 
     try {
         const docSnap = await configDocRef.get();
-        if (!docSnap.exists) {
-            console.log('Config document does not exist. Skipping sync.');
-            return;
-        }
+        if (!docSnap.exists) { console.log('Config document does not exist. Skipping sync.'); return; }
 
         const config = docSnap.data();
         const user = config.githubUser;
-        // Make a deep copy to avoid mutation issues
         const trackedRepos = JSON.parse(JSON.stringify(config.trackedRepos || []));
 
-        if (!user || trackedRepos.length === 0) {
-            console.log('No GitHub user or tracked repos configured. Skipping sync.');
-            return;
-        }
+        if (!user || trackedRepos.length === 0) { console.log('No GitHub user or tracked repos configured. Skipping sync.'); return; }
 
         for (const repo of trackedRepos) {
             console.log(`- Syncing ${repo.name}...`);
-            const tree = await fetchRepoTreeRecursive(user, repo.name, repo.branch, token);
-            if (tree) {
-                repo.tree = tree; // Store the cached tree on the repo object
-                console.log(`- Successfully synced ${repo.name} with ${tree.length} items.`);
+            try {
+                // Fetch both the file tree and the list of branches
+                const [treeData, branchesData] = await Promise.all([
+                    fetchFromGitHub(`https://api.github.com/repos/${user}/${repo.name}/git/trees/${repo.branch}?recursive=1`, token),
+                    fetchFromGitHub(`https://api.github.com/repos/${user}/${repo.name}/branches`, token)
+                ]);
+
+                if (treeData.truncated) {
+                    console.warn(`- WARNING: File tree for ${repo.name} was truncated.`);
+                }
+                
+                repo.tree = treeData.tree.map(item => ({
+                    ...item,
+                    download_url: item.type === 'blob' ? `https://raw.githubusercontent.com/${user}/${repo.name}/${repo.branch}/${item.path}` : null
+                }));
+                
+                repo.branches = branchesData.map(b => b.name);
+                
+                console.log(`- Successfully synced ${repo.name} with ${repo.tree.length} items and ${repo.branches.length} branches.`);
+
+            } catch (error) {
+                console.error(`- Failed to sync ${repo.name}: ${error.message}`);
+                // Keep old data if sync fails for one repo
             }
         }
 
@@ -96,17 +86,14 @@ async function syncAllTrackedRepos() {
     }
 }
 
-// Schedule the sync to run every 24 hours and also run it once on startup.
 setInterval(syncAllTrackedRepos, 24 * 60 * 60 * 1000);
-setTimeout(syncAllTrackedRepos, 10000); // Run 10s after server start to allow for initialization
+setTimeout(syncAllTrackedRepos, 10000);
 
-
-// --- Express App Setup ---
+// --- Express App Setup & Middleware ---
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
 
-// --- Authentication Middleware ---
 const authenticate = async (req, res, next) => {
   if (!req.headers.authorization || !req.headers.authorization.startsWith('Bearer ')) {
     return res.status(403).send({ error: 'Unauthorized: No token provided.' });
@@ -120,70 +107,73 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-// All routes after this line are protected
 app.use(authenticate);
 
 // --- Admin-Only Routes ---
 
-// Proxy for admins to fetch their full list of repos for management
-app.get('/admin/github-proxy', async (req, res) => {
+// SECURE Proxy for admins to fetch their repo list. Uses server token.
+app.get('/admin/github-repos', async (req, res) => {
     if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
-    const { url } = req.query;
-    const token = req.headers['x-github-token'];
-    if (!url || !token) return res.status(400).send({ error: 'Missing URL or GitHub Token' });
+    const { user } = req.query;
+    if (!user) return res.status(400).send({ error: 'Missing GitHub username' });
+    
+    const token = process.env.GITHUB_TOKEN;
+    if (!token) return res.status(500).send({ error: 'Server configuration error' });
 
     try {
-        const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
-        const data = await response.json();
-        res.status(response.status).json(data);
+        const repos = await fetchFromGitHub(`https://api.github.com/users/${user}/repos?per_page=100`, token);
+        res.status(200).json(repos);
     } catch (error) {
-        res.status(500).send({ error: 'Internal Server Error' });
+        res.status(500).send({ error: error.message });
     }
 });
 
-// Endpoint to manually trigger the repository sync
 app.post('/admin/sync-github', async (req, res) => {
     if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
-    
-    // Run async in the background, don't wait for it to finish
-    syncAllTrackedRepos();
-    res.status(202).send({ message: 'GitHub sync started successfully. Data will update shortly.' });
+    syncAllTrackedRepos(); // Run in background
+    res.status(202).send({ message: 'GitHub sync started. Data will update shortly.' });
 });
 
 // --- Owner-Only User Management ---
-app.get('/admin/users', async (req, res) => {
-    if (!req.user.owner) return res.status(403).send({ error: 'Forbidden' });
+app.post('/claim-owner-role', async (req, res) => {
+    if (req.user.email !== process.env.OWNER_EMAIL) {
+        return res.status(403).send({ error: 'Forbidden: Only the designated owner can perform this action.' });
+    }
     try {
-        const listUsersResult = await admin.auth().listUsers(1000);
-        const users = listUsersResult.users.map(user => ({
-            uid: user.uid,
-            email: user.email,
-            isAdmin: !!user.customClaims?.admin,
-            isOwner: !!user.customClaims?.owner,
-        }));
-        res.status(200).json(users);
+        await admin.auth().setCustomUserClaims(req.user.uid, { admin: true, owner: true });
+        res.status(200).send({ message: 'Success! You have been granted owner & admin privileges.' });
     } catch (error) {
-        res.status(500).send({ error: 'Failed to list users.' });
+        res.status(500).send({ error: 'Failed to grant owner role.' });
     }
 });
 
-app.post('/admin/set-role', async (req, res) => {
+app.post('/grant-admin-role', async (req, res) => {
     if (!req.user.owner) return res.status(403).send({ error: 'Forbidden' });
-    const { uid, isAdmin } = req.body;
+    const { email } = req.body;
+    if (!email) return res.status(400).send({ error: 'Missing email.' });
     try {
-        const user = await admin.auth().getUser(uid);
-        if (user.customClaims?.owner) {
-            return res.status(400).send({ error: "Cannot change the owner's roles." });
-        }
-        await admin.auth().setCustomUserClaims(uid, { ...user.customClaims, admin: isAdmin });
-        res.status(200).send({ message: 'User role updated successfully.' });
+        const userToMakeAdmin = await admin.auth().getUserByEmail(email);
+        await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, { admin: true });
+        res.status(200).send({ message: `Success! ${email} is now an admin.` });
     } catch (error) {
-        res.status(500).send({ error: 'Failed to set user role.' });
+        res.status(500).send({ error: error.message || 'Failed to grant admin role.' });
     }
 });
 
+app.post('/revoke-admin-role', async (req, res) => {
+    if (!req.user.owner) return res.status(403).send({ error: 'Forbidden' });
+    const { email } = req.body;
+    if (!email) return res.status(400).send({ error: 'Missing email.' });
+    if (email === process.env.OWNER_EMAIL) return res.status(400).send({ error: "Cannot revoke the owner's admin role." });
+    try {
+        const userToRevoke = await admin.auth().getUserByEmail(email);
+        await admin.auth().setCustomUserClaims(userToRevoke.uid, null); // Revokes all claims
+        res.status(200).send({ message: `Success! Admin role for ${email} has been revoked.` });
+    } catch (error) {
+        res.status(500).send({ error: error.message || 'Failed to revoke admin role.' });
+    }
+});
 
-// Start the Express server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
