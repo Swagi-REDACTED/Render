@@ -118,7 +118,12 @@ app.post('/grant-admin-role', async (req, res) => {
   }
   try {
     const userToMakeAdmin = await admin.auth().getUserByEmail(email);
-    await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, { admin: true });
+    // ✅ FIXED: Preserve existing claims instead of overwriting them.
+    const existingClaims = (await admin.auth().getUser(userToMakeAdmin.uid)).customClaims || {};
+    await admin.auth().setCustomUserClaims(userToMakeAdmin.uid, {
+        ...existingClaims,
+        admin: true
+    });
     return res.status(200).send({ message: `Success! ${email} has been made an admin.` });
   } catch (error) {
     console.error('Error granting admin role:', error);
@@ -140,7 +145,10 @@ app.post('/revoke-admin-role', async (req, res) => {
     }
     try {
         const userToRevoke = await admin.auth().getUserByEmail(email);
-        await admin.auth().setCustomUserClaims(userToRevoke.uid, {});
+        // ✅ FIXED: Preserve other claims by just removing the admin one.
+        const existingClaims = (await admin.auth().getUser(userToRevoke.uid)).customClaims || {};
+        delete existingClaims.admin;
+        await admin.auth().setCustomUserClaims(userToRevoke.uid, existingClaims);
         return res.status(200).send({ message: `Success! Admin role for ${email} has been revoked.` });
     } catch (error) {
         console.error('Error revoking admin role:', error);
