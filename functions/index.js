@@ -38,6 +38,9 @@ async function fetchRepoTreeRecursive(user, repoName, branch, token) {
             return null;
         }
         const data = await response.json();
+        if (data.truncated) {
+            console.warn(`Warning: File tree for ${repoName} was truncated. Some files may be missing.`);
+        }
         // Add a direct download_url to each file for easy access on the frontend
         return data.tree.map(item => ({
             ...item,
@@ -69,7 +72,8 @@ async function syncAllTrackedRepos() {
 
         const config = docSnap.data();
         const user = config.githubUser;
-        const trackedRepos = config.trackedRepos || [];
+        // Make a deep copy to avoid mutation issues
+        const trackedRepos = JSON.parse(JSON.stringify(config.trackedRepos || []));
 
         if (!user || trackedRepos.length === 0) {
             console.log('No GitHub user or tracked repos configured. Skipping sync.');
@@ -94,7 +98,7 @@ async function syncAllTrackedRepos() {
 
 // Schedule the sync to run every 24 hours and also run it once on startup.
 setInterval(syncAllTrackedRepos, 24 * 60 * 60 * 1000);
-setTimeout(syncAllTrackedRepos, 5000); // Run 5s after server start
+setTimeout(syncAllTrackedRepos, 10000); // Run 10s after server start to allow for initialization
 
 
 // --- Express App Setup ---
@@ -123,6 +127,7 @@ app.use(authenticate);
 
 // Proxy for admins to fetch their full list of repos for management
 app.get('/admin/github-proxy', async (req, res) => {
+    if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
     const { url } = req.query;
     const token = req.headers['x-github-token'];
     if (!url || !token) return res.status(400).send({ error: 'Missing URL or GitHub Token' });
@@ -140,9 +145,9 @@ app.get('/admin/github-proxy', async (req, res) => {
 app.post('/admin/sync-github', async (req, res) => {
     if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
     
-    syncAllTrackedRepos()
-        .then(() => res.status(200).send({ message: 'GitHub sync started successfully.' }))
-        .catch(err => res.status(500).send({ error: 'Failed to start sync.' }));
+    // Run async in the background, don't wait for it to finish
+    syncAllTrackedRepos();
+    res.status(202).send({ message: 'GitHub sync started successfully. Data will update shortly.' });
 });
 
 // --- Owner-Only User Management ---
