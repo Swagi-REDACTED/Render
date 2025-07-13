@@ -21,7 +21,7 @@ try {
 // --- Express App Setup ---
 const app = express();
 const corsOptions = {
-  origin: 'https://blu-free-file-hosting.firebaseapp.com', // Your frontend URL
+  origin: 'https://blu-free-file-hosting.web.app/', // Your frontend URL
   optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
