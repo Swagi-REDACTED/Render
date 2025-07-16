@@ -111,6 +111,88 @@ const authenticate = async (req, res, next) => {
 
 app.use(authenticate);
 
+// --- User-facing Routes ---
+
+app.post('/vote', async (req, res) => {
+    const { itemId, itemType, direction } = req.body;
+    const userId = req.user.uid;
+    if (!itemId || !itemType || !direction) {
+        return res.status(400).send({ error: 'Missing required voting information.' });
+    }
+
+    const voteDocRef = db.collection('votes').doc(`${userId}_${itemId}`);
+    const value = direction === 'up' ? 1 : -1;
+
+    try {
+        await db.runTransaction(async (transaction) => {
+            const voteDoc = await transaction.get(voteDocRef);
+            const configDoc = await transaction.get(configDocRef);
+            if (!configDoc.exists()) { throw new Error("Config document does not exist!"); }
+            
+            const configData = configDoc.data();
+            const isMega = itemType === 'mega';
+            let items = isMega ? configData.megaProjects : configData.trackedRepos;
+            const itemIndex = items.findIndex(p => (isMega ? p.id : p.name) === itemId);
+            if (itemIndex === -1) { throw new Error("Item not found!"); }
+
+            let currentVote = 0;
+            if (voteDoc.exists()) {
+                currentVote = voteDoc.data().value;
+            }
+
+            if (currentVote === value) { // User is clicking the same button again (undo vote)
+                items[itemIndex].rep = (items[itemIndex].rep || 0) - value;
+                transaction.delete(voteDocRef);
+            } else { // New vote or changing vote
+                let repChange = value;
+                if (currentVote !== 0) { // Was previously voted, remove old value's effect
+                   repChange -= currentVote;
+                }
+                items[itemIndex].rep = (items[itemIndex].rep || 0) + repChange;
+                transaction.set(voteDocRef, { userId, itemId, value });
+            }
+            
+            if (isMega) {
+                transaction.update(configDocRef, { megaProjects: items });
+            } else {
+                transaction.update(configDocRef, { trackedRepos: items });
+            }
+        });
+        res.status(200).send({ message: 'Vote recorded.' });
+    } catch (error) {
+        console.error("Vote transaction failed: ", error);
+        res.status(500).send({ error: "Your vote could not be recorded." });
+    }
+});
+
+app.post('/report', async (req, res) => {
+    const { itemId, itemType, reportType, details, screenshotURL } = req.body;
+    const { uid, email } = req.user;
+
+    if (!itemId || !itemType || !reportType || !details) {
+        return res.status(400).send({ error: 'Missing required report information.' });
+    }
+
+    try {
+        await db.collection('reports').add({
+            userId: uid,
+            userEmail: email,
+            itemId,
+            itemType,
+            reportType,
+            details,
+            screenshotURL: screenshotURL || '',
+            status: 'new',
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        res.status(200).send({ message: 'Report submitted successfully!' });
+    } catch (error) {
+        console.error("Failed to submit report:", error);
+        res.status(500).send({ error: 'Failed to submit report.' });
+    }
+});
+
+
 // --- Admin-Only Routes ---
 
 app.get('/admin/github-repos', async (req, res) => {
