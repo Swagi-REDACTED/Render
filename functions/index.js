@@ -116,6 +116,7 @@ app.use(authenticate);
 app.post('/vote', async (req, res) => {
     const { itemId, itemType, direction } = req.body;
     const userId = req.user.uid;
+
     if (!itemId || !itemType || !['up', 'down'].includes(direction)) {
         return res.status(400).send({ error: 'Missing or invalid voting information.' });
     }
@@ -127,43 +128,57 @@ app.post('/vote', async (req, res) => {
         await db.runTransaction(async (transaction) => {
             const voteDoc = await transaction.get(voteDocRef);
             const configDoc = await transaction.get(configDocRef);
-            if (!configDoc.exists()) { throw new Error("Config document does not exist!"); }
+
+            if (!configDoc.exists()) {
+                throw new Error("Configuration document not found in the database.");
+            }
             
             const configData = configDoc.data();
             const isMega = itemType === 'mega';
             
-            let items = isMega ? (configData.megaProjects || []) : (configData.trackedRepos || []);
-            const itemIndex = items.findIndex(p => (isMega ? p.id : p.name) === itemId);
-            if (itemIndex === -1) { throw new Error("Item not found!"); }
+            const itemsKey = isMega ? 'megaProjects' : 'trackedRepos';
+            const currentItems = configData[itemsKey] || [];
+            
+            const itemIndex = currentItems.findIndex(p => (isMega ? p.id : p.name) === itemId);
 
+            if (itemIndex === -1) {
+                throw new Error(`Item with ID ${itemId} not found in ${itemsKey}.`);
+            }
+
+            const itemToUpdate = currentItems[itemIndex];
             let currentVote = 0;
             if (voteDoc.exists()) {
                 currentVote = voteDoc.data().value;
             }
 
             let repChange = 0;
-            if (currentVote === value) { // User is clicking the same button again (undo vote)
-                repChange = -value;
+
+            if (currentVote === value) {
+                // Undoing vote (e.g., clicking upvote when already upvoted)
+                repChange = -value; // Reverses the original vote
                 transaction.delete(voteDocRef);
-            } else { // New vote or changing vote
-                repChange = value - currentVote; // This correctly calculates the change (e.g., from -1 to 1 is a +2 change)
+            } else {
+                // Casting a new vote or changing an existing one
+                // The change is the new value minus the old vote's value
+                // e.g., changing from downvote (-1) to upvote (1) is a change of 1 - (-1) = +2
+                repChange = value - currentVote;
                 transaction.set(voteDocRef, { userId, itemId, value });
             }
             
-            items[itemIndex].rep = (items[itemIndex].rep || 0) + repChange;
-            
-            if (isMega) {
-                transaction.update(configDocRef, { megaProjects: items });
-            } else {
-                transaction.update(configDocRef, { trackedRepos: items });
-            }
+            const newRep = (itemToUpdate.rep || 0) + repChange;
+            itemToUpdate.rep = newRep;
+
+            // Update the document with the modified array
+            transaction.update(configDocRef, { [itemsKey]: currentItems });
         });
+
         res.status(200).send({ message: 'Vote recorded.' });
     } catch (error) {
-        console.error("Vote transaction failed: ", error);
+        console.error("Vote transaction failed:", error.message);
         res.status(500).send({ error: "Your vote could not be recorded." });
     }
 });
+
 
 app.post('/report', async (req, res) => {
     const { itemId, itemType, reportType, details } = req.body;
