@@ -129,15 +129,16 @@ app.post('/vote', async (req, res) => {
             const voteDoc = await transaction.get(voteDocRef);
             const configDoc = await transaction.get(configDocRef);
 
-            if (!configDoc.exists()) {
+            if (!configDoc.exists) {
                 throw new Error("Configuration document not found in the database.");
             }
             
             const configData = configDoc.data();
             const isMega = itemType === 'mega';
             
+            // Use a temporary variable to hold the array from the database
             const itemsKey = isMega ? 'megaProjects' : 'trackedRepos';
-            const currentItems = configData[itemsKey] || [];
+            const currentItems = configData[itemsKey] ? JSON.parse(JSON.stringify(configData[itemsKey])) : [];
             
             const itemIndex = currentItems.findIndex(p => (isMega ? p.id : p.name) === itemId);
 
@@ -147,7 +148,7 @@ app.post('/vote', async (req, res) => {
 
             const itemToUpdate = currentItems[itemIndex];
             let currentVote = 0;
-            if (voteDoc.exists()) {
+            if (voteDoc.exists) {
                 currentVote = voteDoc.data().value;
             }
 
@@ -178,7 +179,6 @@ app.post('/vote', async (req, res) => {
         res.status(500).send({ error: "Your vote could not be recorded." });
     }
 });
-
 
 app.post('/report', async (req, res) => {
     const { itemId, itemType, reportType, details } = req.body;
