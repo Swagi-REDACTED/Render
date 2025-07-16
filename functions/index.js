@@ -116,8 +116,8 @@ app.use(authenticate);
 app.post('/vote', async (req, res) => {
     const { itemId, itemType, direction } = req.body;
     const userId = req.user.uid;
-    if (!itemId || !itemType || !direction) {
-        return res.status(400).send({ error: 'Missing required voting information.' });
+    if (!itemId || !itemType || !['up', 'down'].includes(direction)) {
+        return res.status(400).send({ error: 'Missing or invalid voting information.' });
     }
 
     const voteDocRef = db.collection('votes').doc(`${userId}_${itemId}`);
@@ -131,7 +131,7 @@ app.post('/vote', async (req, res) => {
             
             const configData = configDoc.data();
             const isMega = itemType === 'mega';
-            // Ensure items array exists
+            
             let items = isMega ? (configData.megaProjects || []) : (configData.trackedRepos || []);
             const itemIndex = items.findIndex(p => (isMega ? p.id : p.name) === itemId);
             if (itemIndex === -1) { throw new Error("Item not found!"); }
@@ -141,17 +141,16 @@ app.post('/vote', async (req, res) => {
                 currentVote = voteDoc.data().value;
             }
 
+            let repChange = 0;
             if (currentVote === value) { // User is clicking the same button again (undo vote)
-                items[itemIndex].rep = (items[itemIndex].rep || 0) - value;
+                repChange = -value;
                 transaction.delete(voteDocRef);
             } else { // New vote or changing vote
-                let repChange = value;
-                if (currentVote !== 0) { // Was previously voted, remove old value's effect
-                   repChange -= currentVote;
-                }
-                items[itemIndex].rep = (items[itemIndex].rep || 0) + repChange;
+                repChange = value - currentVote; // This correctly calculates the change (e.g., from -1 to 1 is a +2 change)
                 transaction.set(voteDocRef, { userId, itemId, value });
             }
+            
+            items[itemIndex].rep = (items[itemIndex].rep || 0) + repChange;
             
             if (isMega) {
                 transaction.update(configDocRef, { megaProjects: items });
@@ -182,7 +181,6 @@ app.post('/report', async (req, res) => {
             itemType,
             reportType,
             details,
-            screenshotURL: '', // Always empty now
             status: 'new',
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -195,6 +193,21 @@ app.post('/report', async (req, res) => {
 
 
 // --- Admin-Only Routes ---
+
+app.delete('/report/:reportId', async (req, res) => {
+    if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
+    const { reportId } = req.params;
+    if (!reportId) return res.status(400).send({ error: 'Missing report ID.' });
+
+    try {
+        const reportRef = db.collection('reports').doc(reportId);
+        await reportRef.delete();
+        res.status(200).send({ message: 'Report deleted successfully.' });
+    } catch (error) {
+        console.error("Failed to delete report:", error);
+        res.status(500).send({ error: 'Failed to delete report.' });
+    }
+});
 
 app.get('/admin/github-repos', async (req, res) => {
     if (!req.user.admin) return res.status(403).send({ error: 'Forbidden' });
