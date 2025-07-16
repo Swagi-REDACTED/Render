@@ -131,7 +131,8 @@ app.post('/vote', async (req, res) => {
             
             const configData = configDoc.data();
             const isMega = itemType === 'mega';
-            let items = isMega ? configData.megaProjects : configData.trackedRepos;
+            // Ensure items array exists
+            let items = isMega ? (configData.megaProjects || []) : (configData.trackedRepos || []);
             const itemIndex = items.findIndex(p => (isMega ? p.id : p.name) === itemId);
             if (itemIndex === -1) { throw new Error("Item not found!"); }
 
@@ -166,7 +167,7 @@ app.post('/vote', async (req, res) => {
 });
 
 app.post('/report', async (req, res) => {
-    const { itemId, itemType, reportType, details, screenshotURL } = req.body;
+    const { itemId, itemType, reportType, details } = req.body;
     const { uid, email } = req.user;
 
     if (!itemId || !itemType || !reportType || !details) {
@@ -181,7 +182,7 @@ app.post('/report', async (req, res) => {
             itemType,
             reportType,
             details,
-            screenshotURL: screenshotURL || '',
+            screenshotURL: '', // Always empty now
             status: 'new',
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
